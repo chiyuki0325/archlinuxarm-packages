@@ -1,0 +1,125 @@
+# Maintainer: Kirikaze Chiyuki <me@chyk.ink>
+
+buildarch=8
+
+pkgname=linux-nabu-chiyuki
+pkgbase=$pkgname
+_srcname=linux-6.1.10
+_kernelname=${pkgbase#linux}
+_desc="modified for Xiaomi Pad 5 (nabu) with some custom patches"
+pkgver=6.1.10
+pkgrel=1
+arch=('aarch64')
+url="https://github.com/maverickjb/linux-6.1.10"
+license=('GPL2')
+makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'uboot-tools' 'dtc' 'llvm')
+options=('!strip')
+source=("git+${url}.git"
+        '0001-cjktty.patch::https://github.com/zhmars/cjktty-patches/raw/master/v6.x/cjktty-6.1.patch'
+        '0002-bbr2.patch::https://github.com/CachyOS/kernel-patches/raw/master/6.1/0001-bbr2.patch'
+        '0003-ksm.patch::https://github.com/CachyOS/kernel-patches/raw/master/6.1/0004-ksm.patch'
+        '0004-zstd-Update-to-upstream-v1.5.5.patch::https://github.com/CachyOS/kernel-patches/raw/master/6.1/0005-zstd-Update-to-upstream-v1.5.5.patch'
+        '0005-sched-bore.patch::https://github.com/CachyOS/kernel-patches/raw/master/6.1/sched/0001-bore.patch'
+        'linux-nabu-chiyuki.preset')
+md5sums=('SKIP'
+         '9ac3e60b839585eaffc96ac4e8df7e5c'  # 0001-cjktty.patch
+         'd6807fdc0abf0185cde588739050c6bc'  # 0002-bbr2.patch
+         '755d34a4590afe9924d3ccbeff1adbfb'  # 0003-ksm.patch
+         'f92959626c0bf51ea9a14a293bc732b4'  # 0004-zstd-Update-to-upstream-v1.5.5.patch
+         'de33f1144d3cb9006fe23abf77e662c3'  # de33f1144d3cb9006fe23abf77e662c3
+         '93f9d0a653ca31f888918228e3af98cd') # linux-nabu-chiyuki.preset
+
+prepare() {
+  cd $_srcname
+
+  echo "Setting version..."
+  echo "-$pkgrel" > localversion.10-pkgrel
+  echo "${pkgbase#linux}" > localversion.20-pkgname
+
+  # ALARM patches
+  git apply ../0001-cjktty.patch
+  git apply ../0002-bbr2.patch
+  git apply ../0003-ksm.patch
+  git apply ../0004-zstd-Update-to-upstream-v1.5.5.patch
+  git apply ../0005-sched-bore.patch
+  ARCH=arm64 LLVM=1 LLVM_IAS=1 make xiaomi_nabu_maverick_defconfig
+
+  sed -i '/^CONFIG_LOCALVERSION/d' .config
+  echo 'CONFIG_LOCALVERSION=-nabu-chiyuki' >> .config
+
+  sed -i 's/^# CONFIG_F2FS_FS .*/CONFIG_F2FS_FS=m/' .config
+  cat << EOF >> .config
+CONFIG_F2FS_STAT_FS=y
+CONFIG_F2FS_FS_XATTR=y
+CONFIG_F2FS_FS_POSIX_ACL=y
+CONFIG_F2FS_FS_COMPRESSION=y
+CONFIG_F2FS_FS_ZSTD=y
+CONFIG_F2FS_IOSTAT=y
+
+CONFIG_EXFAT_FS=m
+CONFIG_EXFAT_DEFAULT_CHARSET="utf8"
+CONFIG_NTFS_FS=m
+CONFIG_NTFS_RW=y
+EOF
+  sed -i '/^CONFIG_LTO_NONE/d' .config
+  sed -i 's/^# CONFIG_LTO_CLANG_THIN .*/CONFIG_LTO_CLANG_THIN=y/' .config
+  sed -i 's/^# CONFIG_CFI_CLANG .*/CONFIG_CFI_CLANG=y/' .config
+
+}
+
+build() {
+  export ARCH=arm64 LLVM=1 LLVM_IAS=1
+  cd ${_srcname}
+
+  # get kernel version
+  make prepare
+  make -s kernelrelease > version
+
+  # build!
+  unset LDFLAGS
+  make ${MAKEFLAGS} Image Image.gz modules
+  # Generate device tree blobs with symbols to support applying device tree overlays in U-Boot
+  make ${MAKEFLAGS} DTC_FLAGS="-@" dtbs
+  unset ARCH LLVM LLVM_IAS
+}
+
+package() {
+  export ARCH=arm64 LLVM=1 LLVM_IAS=1
+  pkgdesc="The Linux Kernel and modules - ${_desc}"
+  depends=('coreutils' 'linux-firmware' 'kmod' 'mkinitcpio>=0.7')
+  optdepends=('wireless-regdb: to set the correct wireless channels of your country')
+  provides=("linux=${pkgver}" "WIREGUARD-MODULE")
+  conflicts=('linux')
+  backup=("etc/mkinitcpio.d/${pkgbase}.preset")
+  install=${pkgname}.install
+
+  cd $_srcname
+  local kernver="$(<version)"
+  local modulesdir="$pkgdir/usr/lib/modules/$kernver"
+
+  echo "Installing boot image and dtbs..."
+  install -Dm644 arch/arm64/boot/Image{,.gz} -t "${pkgdir}/boot"
+  make INSTALL_DTBS_PATH="${pkgdir}/boot/dtbs" dtbs_install
+
+  echo "Installing modules..."
+  make INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1 modules_install
+
+  # remove build link
+  rm "$modulesdir"/build
+
+  # sed expression for following substitutions
+  local _subst="
+    s|%PKGBASE%|${pkgbase}|g
+    s|%KERNVER%|${kernver}|g
+  "
+
+  # install mkinitcpio preset file
+  sed "${_subst}" ../${pkgname}.preset |
+    install -Dm644 /dev/stdin "${pkgdir}/etc/mkinitcpio.d/${pkgbase}.preset"
+
+  # rather than use another hook (90-linux.hook) rely on mkinitcpio's 90-mkinitcpio-install.hook
+  # which avoids a double run of mkinitcpio that can occur
+  install -d "${pkgdir}/usr/lib/initcpio/"
+  echo "dummy file to trigger mkinitcpio to run" > "${pkgdir}/usr/lib/initcpio/$(<version)"
+  unset ARCH LLVM LLVM_IAS
+}
